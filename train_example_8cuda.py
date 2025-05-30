@@ -24,6 +24,7 @@ import argparse
 
 
 from tqdm import tqdm
+from statistics import mean
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from dataclasses import dataclass, asdict
@@ -379,11 +380,13 @@ def train(train_cfg, vlm_cfg):
                     if train_cfg.log_wandb and is_master():
                         run.log({"val_loss": avg_val_loss}, step=global_step)
 
+                    print("global_step, eval_interval: ", global_step, train_cfg.eval_interval)
                     if is_master() and global_step % (train_cfg.eval_interval*2) == 0:
                         eval_model = model.module if is_dist() else model  # unwrap the model for eval if DDP
                         epoch_accuracy = test_mmstar(eval_model, tokenizer, test_loader, device)
                         if epoch_accuracy > best_accuracy:
                             best_accuracy = epoch_accuracy
+                            print("higher accuracy, saving model")
                             eval_model.save_pretrained(save_directory=vlm_cfg.vlm_checkpoint_path)
                         if train_cfg.log_wandb and is_master():
                             run.log({"accuracy": epoch_accuracy}, step=global_step)
@@ -478,11 +481,12 @@ class VLMConfig:
     lm_tie_weights: bool = True # Decide if you want to tie the LM Head weight to the token embedding weights
     lm_model_type: str = 'HuggingFaceTB/SmolLM2-135M'
     lm_tokenizer: str = 'HuggingFaceTB/cosmo2-tokenizer'
+    hf_repo_name: str = 'piupiuisland/nanoVLM-135M'
 
     mp_pixel_shuffle_factor: int = 2
 
     vlm_load_backbone_weights: bool = True
-    vlm_checkpoint_path: str = 'checkpoints/nanoVLM-222M'
+    vlm_checkpoint_path: str = '/home/ubuntu/ruhui-eu/saved_model/piupiuisland/nanoVLM-135M'
 
 
 @dataclass
@@ -494,11 +498,10 @@ class TrainConfig:
     batch_size: int = 32
     max_grad_norm: float = None
     eval_in_epochs: bool = True
-    eval_interval: int = 250
+    eval_interval: int = 100
     val_ratio: float = 0.2
     mmstar_batch_size: int = 32
-    epochs: int = 600
-    eval_in_epochs: bool = False # Deactivating this in colab, because it would evaluate 1500 samples of MMStar every time otherwise
+    epochs: int = 300
     resume_from_vlm_checkpoint: bool = False # Indicate if the training should be resumed from a checkpoint of the whole VLM or you want to start from scratch
     train_dataset_path: str = 'HuggingFaceM4/the_cauldron'
     # train_dataset_name: tuple[str, ...] = ("tqa", "vsr", "vqav2", "aokvqa", "cocoqa", "iconqa", "vqarad") #All options; ("ai2d", "aokvqa", "chart2text", "chartqa", "clevr", "cocoqa", "datikz", "diagram_image_to_text", "docvqa", "dvqa", "figureqa", "finqa", "geomverse", "hateful_memes", "hitab", "iam", "iconqa", "infographic_vqa", "intergps", "localized_narratives", "mapqa", "multihiertt", "ocrvqa", "plotqa", "raven", "rendered_text", "robut_sqa", "robut_wikisql", "robut_wtq", "scienceqa", "screen2words", "st_vqa", "tabmwp", "tallyqa", "tat_qa", "textcaps", "textvqa", "tqa", "vistext", "visual7w", "visualmrc", "vqarad", "vqav2", "vsr", "websight") # "clevr_math", "okvqa", "spot_the_diff", "nlvr2", "mimic_cgd",
@@ -515,5 +518,20 @@ class TrainConfig:
 
 vlm_cfg = VLMConfig()
 train_cfg = TrainConfig(data_cutoff_idx=None)
+
+if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+    init_dist()
+
+if is_master():
+    print("--- VLM Config ---")
+    print(vlm_cfg)
+    print("--- Train Config ---")
+    print(train_cfg)
+
 train(train_cfg, vlm_cfg)
+
+if is_dist():
+    destroy_dist()
+
+
 # %%
