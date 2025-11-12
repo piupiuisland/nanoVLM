@@ -13,6 +13,16 @@
 
 ---
 
+> [!NOTE]
+> We have pushed some more breaking changes on September 9, 2025. These are all the updates to use image splitting and train on multiple nodes. This was used for the ablations of the FineVision release. Some things in the codebase regarding support scripts (eg. the notebook, or memory evals) are propably not working anymore. Similarly to the older trained versions of nanoVLM (similarly to Note below). If you find something that doesn't work anymore please let us know in the Issues or submit a PR!
+
+---
+
+> [!NOTE]
+> We have pushed some breaking changes to the repository on June 4, 2025. To enable us to do smarter packing, we refactored the way image and text embeddings are combined. To keep everything as smooth as possible, we have trained a new nanoVLM-450M with this new pipeline, while leaving the old nanoVLM-222M compatible with the old pipeline If you clone this repository now or pull the updated to your local machine, the default will be the new 450M Model. If you would like a simpler understanding and a simpler codebase, you can use the v0.1 release. This works out of the box with the old 222M model.
+
+---
+
 nanoVLM is the simplest repository for training/finetuning a small sized Vision-Language Model with a lightweight implementation in pure PyTorch. The code itself is very readable and approachable, the model consists of a Vision Backbone (`models/vision_transformer.py` ~150 lines), Language Decoder (`models/language_model.py` ~250 lines), Modality Projection (`models/modality_projection.py` ~50 lines) and the VLM itself (`models/vision_language_model.py` ~100 lines) and a simple training loop (`train.py` ~200 lines).
 
 Similar to Andrej Karpathy's nanoGPT, we wanted to equip the community with a very simple implementation and training script for Vision Language Models. We do not claim this to be a new SOTA model, rather an educational effort that packs quite a bit of punch if you have the right hardware! You should be able to tweak and play around with the code in no time.
@@ -48,11 +58,14 @@ uv init --bare --python 3.12
 uv sync --python 3.12
 source .venv/bin/activate
 uv add torch numpy torchvision pillow datasets huggingface-hub transformers wandb
+# Optional: for lmms-eval integration you have to install it from source, see section 'Evaluation with lmms-eval'
 ```
 
 If you prefer another environment manager, simply install these packages:  
 ```bash
 pip install torch numpy torchvision pillow datasets huggingface-hub transformers wandb
+# Optional: for lmms-eval integration you have to install it from source, see section 'Evaluation with lmms-eval'
+
 ```
 Dependencies: 
 - `torch` <3
@@ -75,13 +88,13 @@ which will use the default `models/config.py`.
 
 ## Generate
 
-To try a [trained model](https://huggingface.co/lusxvr/nanoVLM-222M), you can simply use the provided generate script
+To try a [trained model](https://huggingface.co/lusxvr/nanoVLM-450M), you can simply use the provided generate script
 ```bash
 python generate.py
 ```
-or, to use distributed data parallel with 8 gpus, you can simply run:
+or, to use your own trained model, you can simply run:
 ```bash
-torchrun --nproc_per_node=8 train.py
+python generate.py --checkpoint /your/path/to/trained_models
 ```
 
 If we feed the example image in `assets/image.png` with a question into the model, we get the following output. Even after only short training, the model can recognize the cat in the picture. 
@@ -97,6 +110,33 @@ Generation 4:  This is a cat sitting on the ground. I think this is a cat sittin
 Generation 5:  This is a cat sitting on the ground, which is covered with a mat. I think this is
 ```
 
+### Evaluation with lmms-eval
+
+nanoVLM now supports evaluation using the comprehensive [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) toolkit:
+
+```bash
+# Install lmms-eval (has to be from source)
+uv pip install git+https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+
+# Make sure you have your environment variables set correctly and you are logged in to HF
+export HF_HOME="<Path to HF cache>"
+huggingface-cli login
+
+# Evaluate a trained model on multiple benchmarks
+python evaluation.py --model lusxvr/nanoVLM-450M --tasks mmstar,mme
+
+# If you want to use it during training, simply import the module and call it just as you would from the command line.
+# You can pass all the arguments you can also pass in the command line.
+# The evaluation during training works in the full DDP setup.
+from evaluation import cli_evaluate
+args = argparse.Namespace(
+    model='lusxvr/nanoVLM-450M', # This can be either a checkpoint path or the model itself
+    tasks='mmstar,mmmu,ocrbench',
+    batch_size=128 # Adapt this to your GPU, needs to be passed to avoid an OOM Error
+)
+results = cli_evaluate(args)
+```
+
 ## Hub integration
 
 **nanoVLM** comes with handy methods to load and save the model from the Hugging Face Hub.
@@ -109,7 +149,7 @@ Here is how to load from a repo on the Hugging Face Hub. This is the recommended
 # Load pretrained weights from Hub
 from models.vision_language_model import VisionLanguageModel
 
-model = VisionLanguageModel.from_pretrained("lusxvr/nanoVLM-222M")
+model = VisionLanguageModel.from_pretrained("lusxvr/nanoVLM-450M")
 ```
 
 ### Push to hub
@@ -157,19 +197,21 @@ Understanding the VRAM requirements for training is crucial for selecting the ri
 Here's a breakdown of the approximate peak VRAM usage:
 
 ```
-VRAM allocated after loading model to device: 870.53 MB
---- Summary of VRAM Usage (Default Model) ---
-Batch Size 1:   4439.02 MB
-Batch Size 2:   4461.05 MB
-Batch Size 4:   4515.27 MB
-Batch Size 8:   5062.60 MB
-Batch Size 16:  6989.32 MB
-Batch Size 32:  10880.09 MB
-Batch Size 64:  18584.00 MB
-Batch Size 128: 34043.34 MB
-Batch Size 256: 64944.37 MB
-Batch Size 512: OOM (Peak before OOM: 80228.30 MB)
+VRAM allocated after loading model to device: 871.44 MB
+--- Summary of VRAM Usage ---
+Batch Size 1: 4448.58 MB
+Batch Size 2: 4465.39 MB
+Batch Size 4: 4532.29 MB
+Batch Size 8: 5373.46 MB
+Batch Size 16: 7604.36 MB
+Batch Size 32: 12074.31 MB
+Batch Size 64: 20995.06 MB
+Batch Size 128: 38834.19 MB
+Batch Size 256: 74561.08 MB
+Batch Size 512: OOM (Peak before OOM: 80247.67 MB)
 ```
+
+Note that the VRAM measurement was performed on a small setup using 'SmolLM2-135M' with a maximum input sequence length of 128 tokens. This may differ from the current default configuration in the project.
 
 **Key Takeaways:**
 - You'll need at least ~4.5 GB of VRAM to train the default model even with a batch size of 1.

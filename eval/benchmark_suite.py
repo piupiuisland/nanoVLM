@@ -45,9 +45,8 @@ def benchmark_vlm(
         vlm_load_backbone_weights=True
     )
     model = VisionLanguageModel(cfg, load_backbone=True).to(device).eval()
-    tokenizer = get_tokenizer(cfg.lm_tokenizer)
-    vit_img_size = int(cfg.vit_model_type[-3:])  # Kinda hacky, works for siglip models
-    image_processor = get_image_processor(vit_img_size)
+    tokenizer = get_tokenizer(cfg.lm_tokenizer, cfg.vlm_extra_tokens)
+    image_processor = get_image_processor(cfg.max_img_size, cfg.vit_img_size)
 
     initial_vram_model_mb = 0
     if device.type == 'cuda':

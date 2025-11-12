@@ -1,106 +1,71 @@
 import torch
 
-class VQACollator(object):  # Visual Question Answering Collator
-    def __init__(self, tokenizer, max_length):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-    
-    def __call__(self, batch):
-        images = [item["image"] for item in batch]
-        texts = [item["text_data"] for item in batch]
-        answers = [item["answer"] for item in batch]
 
-        # Stack images
-        images = torch.stack(images)
-
-        # Create inputs by concatenating the question and answer
-        input_sequences = []
-        for i in range(len(texts)):
-            input_sequences.append(f"{texts[i]}{answers[i]}")
-
-        encoded_full_sequences = self.tokenizer.batch_encode_plus(
-            input_sequences,
-            padding="max_length",
-            padding_side="left",
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_length,
-        )
-
-        # Create labels where only answer tokens are predicted
-        input_ids = encoded_full_sequences["input_ids"]
-        attention_mask = encoded_full_sequences["attention_mask"]
-        labels = input_ids.clone()
-        labels[:, :-1] = input_ids[:, 1:].clone()
-        labels[:, -1] = -100 #self.tokenizer.pad_token_id
-
-        # The tokenizer has different behavior for padding and truncation:
-        # 1. If the full text (answer + question) is shorter than the max length, it gets padded on the left
-        # 2. If the full text is longer than the max length, it gets truncated on the right
-        # Therefore, I need to handle multiple cases, this is the different scenarios:
-        # If the full text is longer than the max length, we need to set the labels to -100 for the whole sample (we want to ignore the whole sample)
-        # If the full text is shorter than the max length, we need to set the labels to -100 only for the question part, and create causal language modeling labels for the answer part, taking into account the padding
-
-        # Determine if sequences were truncated
-        original_lengths = [len(self.tokenizer.encode(seq)) for seq in input_sequences]
-        
-        for i in range(len(batch)):
-            # Get the length of the question for this sample
-            question_length = len(self.tokenizer.encode(texts[i], add_special_tokens=False))
-            
-            # Case 1: If sequence was truncated (original is longer than max_length)
-            if original_lengths[i] > self.max_length:
-                # Set all labels to -100 to ignore this sample entirely
-                labels[i, :] = -100
-                #print(f"Sample {i} was truncated. Setting all labels to -100.")
-                continue
-            
-            # Case 2: Sequence fits within max_length
-            # Use attention mask to find first non-padding token
-            # The first 1 in the attention mask marks the first non-padding token
-            first_token_pos = attention_mask[i].nonzero(as_tuple=True)[0][0].item()
-            
-            # Set labels for padding and question part to -100 (don't predict these), substracting 1 to account for the left shift
-            question_end = first_token_pos + question_length - 1 
-            labels[i, :question_end] = -100
-            # labels[i, original_lengths[i]-1:] = -100 # If you are using right padding
-
-        return {
-            "image": images,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels
-        }
-
-class MMStarCollator(object):  # https://huggingface.co/datasets/Lin-Chen/MMStar
+class BaseCollator(object):
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
-    
-    def __call__(self, batch):
-        images = [item["image"] for item in batch]
-        questions = [item["text_data"] for item in batch]
-        answers = [item["answer"] for item in batch]
 
-        # Stack images
-        images = torch.stack(images)
-        
-        encoded_question_sequences = self.tokenizer.batch_encode_plus(
-            questions,
-            padding=True,
-            padding_side="left",
-            return_tensors="pt"
-        )
+    def _pad_batch(self, batch, max_length):
+        batch["input_ids"] = [torch.nn.functional.pad(ids, (max_length - len(ids), 0), value=self.tokenizer.pad_token_id) for ids in batch["input_ids"]]
+        batch["labels"]    = [torch.nn.functional.pad(labels, (max_length - len(labels), 0), value=self.tokenizer.pad_token_id) for labels in batch["labels"]]
+        batch["attention_mask"] = [torch.nn.functional.pad(attention_mask, (max_length - len(attention_mask), 0), value=0) for attention_mask in batch["attention_mask"]]
 
-        encoded_answer_sequences = self.tokenizer.batch_encode_plus(
-            answers,
-            padding=True,
-            padding_side="left",
-            return_tensors="pt"
-        )
-        
+    def prepare_batch(self, batch, max_length=None):
+        # 1) Handle empty
+        if not batch:
+            return {"input_ids": [], "labels": [], "attention_mask": [], "images": []}
+
+        # 2) Drop None rows
+        batch = [s for s in batch if s is not None]
+        if not batch:
+            return {"input_ids": [], "labels": [], "attention_mask": [], "images": []}
+
+        # batch is a list of dicts, each containing "input_ids", "attention_mask", "labels", "images"
+        # let's convert it to a dict of lists of tensors
+        batch = {k: [item[k] for item in batch] for k in batch[0]}
+
+        if max_length is not None:
+            batch = self._discard_samples_that_are_too_long(batch, max_length)
+
+        if len(batch["input_ids"]) == 0:
+            return batch
+
+        # Pad samples to max length
+        if max_length is not None:
+            max_len = max_length
+        else:
+            max_len = max(map(len, batch["input_ids"]))
+        self._pad_batch(batch, max_len) #  dictionaries in Python are mutable and passed by reference
+
         return {
-            "images": images,
-            "input_ids": encoded_question_sequences['input_ids'],
-            "attention_mask": encoded_question_sequences['attention_mask'],
-            "labels": encoded_answer_sequences['input_ids'],
+            "input_ids": torch.stack(batch["input_ids"]),
+            "attention_mask": torch.stack(batch["attention_mask"]),
+            "images": batch["images"],
+            "labels": torch.stack(batch["labels"]),
         }
+
+    def _discard_samples_that_are_too_long(self, batch, max_length):
+        filtered = [
+            (ids, label, attn, img)
+            for ids, label, attn, img in zip(batch["input_ids"], batch["labels"], batch["attention_mask"], batch["images"])
+            if len(ids) <= max_length
+        ]
+        if not filtered:
+            return {"input_ids": [], "labels": [], "attention_mask": [], "images": []}
+        batch_token_ids, batch_labels, batch_attentions, batch_images = zip(*filtered)
+        return {"input_ids": list(batch_token_ids), "labels": list(batch_labels), "attention_mask": list(batch_attentions), "images": list(batch_images)}
+
+
+class VQACollator(BaseCollator):  # Visual Question Answering Collator
+    def __init__(self, tokenizer, max_length):
+        self.max_length = max_length
+        super().__init__(tokenizer)
+
+    def _pad_batch(self, batch, max_length):  # Reimplementing to use -100 as the pad value for labels, so that it's ignored by the loss
+        batch["input_ids"] = [torch.nn.functional.pad(ids, (max_length - len(ids), 0), value=self.tokenizer.pad_token_id) for ids in batch["input_ids"]]
+        batch["labels"]    = [torch.nn.functional.pad(labels, (max_length - len(labels), 0), value=-100) for labels in batch["labels"]]
+        batch["attention_mask"] = [torch.nn.functional.pad(attention_mask, (max_length - len(attention_mask), 0), value=0) for attention_mask in batch["attention_mask"]]
+
+    def __call__(self, batch):
+        batch = self.prepare_batch(batch, max_length=self.max_length)
+        return batch

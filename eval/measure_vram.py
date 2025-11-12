@@ -32,7 +32,7 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
         print("Compiling the model with torch.compile...")
         model = torch.compile(model)
         print("Model compiled.")
-    
+
     model.to(device)
 
     # Measure VRAM after model is loaded to device
@@ -44,8 +44,8 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
     print(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
 
     # --- Dataset Preparation ---
-    image_processor = get_image_processor(vlm_cfg.vit_img_size)
-    tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
+    image_processor = get_image_processor(vlm_cfg.max_img_size, vlm_cfg.vit_img_size)
+    tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer, vlm_cfg.vlm_extra_tokens)
 
     dataset_path = train_cfg_defaults.train_dataset_path
     # train_cfg_defaults.train_dataset_name is a list, use the first if not specified
@@ -55,7 +55,7 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
     if not batch_sizes_to_test:
         print("Error: No batch sizes provided or parsed correctly.")
         return
-    
+
     num_iterations_for_vram = args.num_iterations
     max_bs_to_test = max(batch_sizes_to_test)
     required_samples_for_base_ds = max_bs_to_test * num_iterations_for_vram
@@ -65,9 +65,9 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
         # Attempt to load only the 'train' split, adjust if dataset has different split names
         available_splits = load_dataset(dataset_path, dataset_name).keys()
         split_to_use = 'train' if 'train' in available_splits else list(available_splits)[0]
-        
+
         base_ds_full = load_dataset(dataset_path, dataset_name, split=split_to_use)
-        
+
         if len(base_ds_full) < required_samples_for_base_ds:
             print(f"Warning: Dataset '{dataset_name}' (split: {split_to_use}) has {len(base_ds_full)} samples, "
                   f"but {required_samples_for_base_ds} are recommended for max batch size {max_bs_to_test} "
@@ -81,7 +81,7 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
         print("Please ensure the dataset path and name are correct.")
         return
 
-    processed_base_dataset = VQADataset(base_ds_for_vram_test, tokenizer, image_processor)
+    processed_base_dataset = VQADataset(base_ds_for_vram_test, tokenizer, image_processor, vlm_cfg.mp_image_token_length)
     vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
 
     print("\n--- VRAM Measurement ---")
@@ -89,7 +89,7 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
 
     for bs in batch_sizes_to_test:
         print(f"\nTesting Batch Size: {bs}")
-        
+
         if len(processed_base_dataset) < bs:
             print(f"Base processed dataset has {len(processed_base_dataset)} samples, "
                   f"not enough for batch size {bs}. Skipping.")
@@ -99,7 +99,7 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
         current_loader = DataLoader(
             processed_base_dataset,
             batch_size=bs,
-            shuffle=False, 
+            shuffle=False,
             collate_fn=vqa_collator,
             num_workers=0,
             pin_memory=True,
@@ -117,16 +117,16 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
 
         # Reset CUDA memory stats for each batch size test
         torch.cuda.reset_peak_memory_stats(device)
-        
+
         # Model to train mode for realistic scenario (e.g. dropout layers active)
-        model.train() 
+        model.train()
         optimizer = optim.AdamW(model.parameters(), lr=1e-5) # Dummy optimizer
 
         try:
             for i, batch in enumerate(current_loader):
                 if i >= num_iterations_for_vram:
                     break
-                
+
                 images = batch["image"].to(device)
                 input_ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
@@ -136,7 +136,7 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
 
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16): # Doing autocast to stay close the train.py script
                     _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
-                
+
                 if loss is not None:
                     loss.backward()
                     optimizer.step()
@@ -167,7 +167,7 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
             if 'labels' in locals(): del labels
             if 'attention_mask' in locals(): del attention_mask
             torch.cuda.empty_cache()
-    
+
     print("\n--- Summary of VRAM Usage ---")
     for bs, vram_usage in results.items():
         print(f"Batch Size {bs}: {vram_usage}")
@@ -175,17 +175,19 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
 
 def main():
     parser = argparse.ArgumentParser(description="Measure VRAM usage for a VisionLanguageModel at different batch sizes.")
-    
+
     # Model and Config args
     parser.add_argument('--compile', action='store_true', help='Compile the model with torch.compile.')
 
     # Measurement control args
-    parser.add_argument('--batch_sizes', type=str, default="1 2 4", help='Space-separated list of batch sizes to test (e.g., "1 2 4 8").')
+    parser.add_argument('--batch_sizes', type=str, default="1 2 4 8 16 32 64 128 256 512", help='Space-separated list of batch sizes to test (e.g., "1 2 4 8").')
+    parser.add_argument('--lm_max_length', type=int, default=128, help='Maximum length of the input sequence for the language model.')
+    parser.add_argument('--lm_model_type', type=str, default='HuggingFaceTB/SmolLM2-135M-Instruct', help='Model type for the language model.')
     parser.add_argument('--num_iterations', type=int, default=2, help='Number of forward/backward passes per batch size for VRAM measurement.')
 
     args = parser.parse_args()
 
-    vlm_cfg = config.VLMConfig()
+    vlm_cfg = config.VLMConfig(lm_max_length=args.lm_max_length, lm_model_type=args.lm_model_type)
     train_cfg_defaults = config.TrainConfig() # Used for default dataset path/name if not provided by CLI
 
     print("--- VLM Config (from models.config) ---")
@@ -193,8 +195,8 @@ def main():
     print("--- Train Config Defaults (for dataset path/name if not specified via CLI) ---")
     print(f"Default dataset_path: {train_cfg_defaults.train_dataset_path}")
     print(f"Default dataset_name list: {train_cfg_defaults.train_dataset_name}")
-    
+
     measure_vram(args, vlm_cfg, train_cfg_defaults)
 
 if __name__ == "__main__":
-    main() 
+    main()
